@@ -5,8 +5,10 @@ try:
 except ImportError:  # PyPy
     pass
 import functools
+import importlib
 import os
 import subprocess
+import sys
 import sysconfig
 
 import pytest
@@ -14,13 +16,24 @@ import pytest
 
 # #712: the OOM test needs the oomshim helper built next to the tests.
 # It's test-only (never shipped in the wheel), so build it here when it's
-# missing instead of needing a gcc line by hand. If the build fails the
-# test skips itself (oomshim stays None in test_ujson).
-try:
-    import oomshim
-except ImportError:
-    here = os.path.dirname(os.path.abspath(__file__))
-    target = os.path.join(here, "oomshim" + sysconfig.get_config_var("EXT_SUFFIX"))
+# missing instead of needing a compiler line by hand. Building through
+# setuptools picks the right compiler and flags per platform (MSVC on
+# Windows, -bundle on macOS), same toolchain that builds ujson itself.
+# Minimal images without setuptools at test time (alpine) fall back to a
+# plain cc line. PyPy and GraalPy have no usable hook API (missing
+# declarations / fatal abort), so don't waste time building there.
+# If nothing works the test skips itself (oomshim None).
+def _build_oomshim(here):
+    try:
+        subprocess.run(
+            [sys.executable, os.path.join(here, "setup_oomshim.py")],
+            cwd=here,
+            check=True,
+            capture_output=True,
+        )
+        return True
+    except Exception:
+        pass
     try:
         subprocess.run(
             [
@@ -30,14 +43,28 @@ except ImportError:
                 "-I" + sysconfig.get_paths()["include"],
                 os.path.join(here, "oomshim.c"),
                 "-o",
-                target,
+                os.path.join(here, "oomshim" + sysconfig.get_config_var("EXT_SUFFIX")),
             ],
             check=True,
             capture_output=True,
         )
-        import oomshim
+        return True
     except Exception:
-        pass
+        return False
+
+
+try:
+    if sys.implementation.name in ("graalpy", "pypy"):
+        oomshim = None
+    else:
+        oomshim = importlib.import_module("oomshim")
+except ImportError:
+    oomshim = None
+    if _build_oomshim(os.path.dirname(os.path.abspath(__file__))):
+        try:
+            oomshim = importlib.import_module("oomshim")
+        except ImportError:
+            pass
 
 
 def pytest_addoption(parser, pluginmanager):

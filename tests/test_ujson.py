@@ -1719,7 +1719,15 @@ def test_nested_json_decode_error():
 # #712: the big-int fallback path mallocs len+1 for PyLong_FromString. Fail
 # that exact size through the OBJ allocator shim so the OOM lands on the
 # same spot every run, however much RAM the box has.
-@pytest.mark.skipif(oomshim is None, reason="oomshim helper did not build")
+@pytest.mark.skipif(
+    oomshim is None, reason="oomshim helper unavailable on this interpreter"
+)
+# GraalPy builds the shim but aborts on PyMem_GetAllocator (fatal, not
+# catchable), and PyPy doesn't declare the hook API at all.
+@pytest.mark.skipif(
+    sys.implementation.name in ("graalpy", "pypy"),
+    reason="no PyMem allocator hooks on this interpreter",
+)
 def test_big_int_buffer_oom():
     payload = b"9" * 4000
     fail_size = len(payload) + 1

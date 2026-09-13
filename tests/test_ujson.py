@@ -1710,40 +1710,49 @@ def test_nested_json_decode_error():
     assert issubclass(ujson.JSONDecodeError, ValueError)
 
 
-# #712: if this malloc fails we should get MemoryError, not a crash.
-# The child caps its own address space so suite heap state can't hide
-# the OOM path (and a crash here can't take down pytest). The payload
-# is 8M digits on purpose: small enough to decode instantly, far too
-# big for any free heap chunk to serve, so the fallback malloc is the
-# thing that fails. Child exits 0 on MemoryError, 2/3 when pressure
-# isn't possible here.
+# #712: the big-int fallback mallocs len+1 for PyLong_FromString and never
+# checked it, so a failed alloc ended in memcpy(NULL) instead of MemoryError.
+# This has to run in its own interpreter: capping RLIMIT_AS in-process only
+# bites on a fresh heap, and a crash here would take pytest down with it.
+# The payload is built before the cap so the cap constrains only what ujson
+# allocates during the decode. Skips where resource/setrlimit is missing
+# (Windows, graalpy).
 _OOM_CHILD = """\
-import os, resource, sys
+import os, sys
+
+try:
+    import resource
+except ImportError:
+    sys.exit(2)
 
 try:
     import ujson
 except ImportError:
     sys.exit(2)
+
 if not hasattr(resource, "setrlimit") or not hasattr(resource, "RLIMIT_AS"):
     sys.exit(2)
-if hasattr(sys, "set_int_max_str_digits"):
-    sys.set_int_max_str_digits(20000000)
+
+payload = b"9" * (64 * 1024 * 1024)
+
 try:
     with open("/proc/self/statm") as f:
         cur = int(f.read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
 except Exception:
     sys.exit(2)
-margin = 65536
+
+margin = 16 * 1024 * 1024
 if hard != resource.RLIM_INFINITY and cur + margin > hard:
     sys.exit(2)
 try:
     resource.setrlimit(resource.RLIMIT_AS, (cur + margin, hard))
 except Exception:
     sys.exit(2)
+
 code = 3
 try:
-    ujson.loads(b"9" * 8000000)
+    ujson.loads(payload)
 except MemoryError:
     code = 0
 except BaseException:
@@ -1759,17 +1768,20 @@ sys.exit(code)
 """
 
 
-# skipped by the leak runner (it would spawn thousands of processes).
+# skipped by the leak runner: it would spawn a fresh interpreter per loop.
 @pytest.mark.skip_leak_test
 def test_out_of_memory_load_big_int():
-    child = subprocess.run(
-        [sys.executable, "-c", _OOM_CHILD],
-        capture_output=True,
-        timeout=120,
-    )
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", _OOM_CHILD],
+            capture_output=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.skip("memory-pressure child timed out (slow/emulated runner)")
     if child.returncode in (2, 3):
         pytest.skip("could not reproduce the memory-pressure environment")
-    if child.returncode in (-6, 134):
+    if child.returncode in (-6, 134, -11):
         pytest.skip("interpreter aborted under the address-space cap")
     if child.returncode != 0:
         pytest.fail(

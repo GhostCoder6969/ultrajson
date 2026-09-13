@@ -2,6 +2,7 @@ import copy
 import datetime as dt
 import decimal
 import enum
+import gc
 import io
 import json
 import math
@@ -19,6 +20,11 @@ from pathlib import Path
 import pytest
 
 import ujson
+
+try:
+    import oomshim  # test-only helper, built by conftest if missing
+except ImportError:
+    oomshim = None
 
 
 def assert_almost_equal(a, b):
@@ -1710,93 +1716,36 @@ def test_nested_json_decode_error():
     assert issubclass(ujson.JSONDecodeError, ValueError)
 
 
-# #712: the big-int fallback mallocs len+1 for PyLong_FromString and never
-# checked it, so a failed alloc ended in memcpy(NULL) instead of MemoryError.
-# This has to run in its own interpreter: capping RLIMIT_AS in-process only
-# bites on a fresh heap, and a crash here would take pytest down with it.
-# The payload is built before the cap so the cap constrains only what ujson
-# allocates during the decode. Skips where resource/setrlimit is missing
-# (Windows, graalpy).
-_OOM_CHILD = """\
-import os, sys
-
-try:
-    import resource
-except ImportError:
-    sys.exit(2)
-
-try:
-    import ujson
-except ImportError:
-    sys.exit(2)
-
-if not hasattr(resource, "setrlimit") or not hasattr(resource, "RLIMIT_AS"):
-    sys.exit(2)
-
-payload = b"9" * (64 * 1024 * 1024)
-
-try:
-    with open("/proc/self/statm") as f:
-        cur = int(f.read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
-    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-except Exception:
-    sys.exit(2)
-
-margin = 16 * 1024 * 1024
-if hard != resource.RLIM_INFINITY and cur + margin > hard:
-    sys.exit(2)
-try:
-    resource.setrlimit(resource.RLIMIT_AS, (cur + margin, hard))
-except Exception:
-    sys.exit(2)
-
-code = 3
-try:
-    ujson.loads(payload)
-except MemoryError:
-    code = 0
-except BaseException as e:
-    sys.stderr.write("non-MemoryError under cap: %r\n" % (e,))
-    code = 4
-else:
-    code = 3
-finally:
+# #712: the big-int fallback path mallocs len+1 for PyLong_FromString. Fail
+# that exact size through the OBJ allocator shim so the OOM lands on the
+# same spot every run, however much RAM the box has.
+@pytest.mark.skipif(oomshim is None, reason="oomshim helper did not build")
+def test_big_int_buffer_oom():
+    payload = b"9" * 4000
+    fail_size = len(payload) + 1
+    # The first caught OOM in a fresh frame keeps one interpreter block
+    # alive (a bare `raise MemoryError` does the same with no ujson
+    # involved), so only the runs after that one have to come back fully
+    # clean. failures == 1 proves the OOM hit the fallback buffer itself:
+    # without the fix this crashes instead of raising.
+    oomshim.install(fail_size)
     try:
-        resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
-    except Exception:
-        pass
-sys.exit(code)
-"""
-
-
-# skipped by the leak runner: it would spawn a fresh interpreter per loop.
-@pytest.mark.skip_leak_test
-def test_out_of_memory_load_big_int():
-    try:
-        child = subprocess.run(
-            [sys.executable, "-c", _OOM_CHILD],
-            capture_output=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        pytest.skip("memory-pressure child timed out (slow/emulated runner)")
-    if child.returncode in (2, 3):
-        pytest.skip("could not reproduce the memory-pressure environment")
-    if child.returncode in (-6, 134, -11):
-        pytest.skip("interpreter aborted under the address-space cap")
-    if child.returncode == 4:
-        # free-threaded and some emulated targets raise a different error
-        # under the cap; not our bug to chase here, keep the detail visible.
-        lines = child.stderr.decode("utf-8", "replace").strip().splitlines()
-        pytest.skip(
-            "platform raises %s instead of MemoryError under the cap"
-            % (lines[-1] if lines else "unknown error")
-        )
-    if child.returncode != 0:
-        pytest.fail(
-            "ujson.loads crashed under memory pressure instead of raising "
-            "MemoryError (exit %d), see issue #712" % child.returncode
-        )
+        with pytest.raises(MemoryError):
+            ujson.loads(payload)
+    finally:
+        gc.collect()
+        oomshim.uninstall()
+    assert oomshim.failures() == 1
+    for data in (payload, b"[" + payload + b"]"):
+        oomshim.install(fail_size)
+        try:
+            with pytest.raises(MemoryError):
+                ujson.loads(data)
+        finally:
+            gc.collect()
+            oomshim.uninstall()
+        assert oomshim.failures() == 1
+        assert oomshim.live() == 0
 
 
 def test_bad_arguments():

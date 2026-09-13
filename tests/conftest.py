@@ -5,8 +5,39 @@ try:
 except ImportError:  # PyPy
     pass
 import functools
+import os
+import subprocess
+import sysconfig
 
 import pytest
+
+
+# #712: the OOM test needs the oomshim helper built next to the tests.
+# It's test-only (never shipped in the wheel), so build it here when it's
+# missing instead of needing a gcc line by hand. If the build fails the
+# test skips itself (oomshim stays None in test_ujson).
+try:
+    import oomshim
+except ImportError:
+    here = os.path.dirname(os.path.abspath(__file__))
+    target = os.path.join(here, "oomshim" + sysconfig.get_config_var("EXT_SUFFIX"))
+    try:
+        subprocess.run(
+            [
+                os.environ.get("CC", "cc"),
+                "-shared",
+                "-fPIC",
+                "-I" + sysconfig.get_paths()["include"],
+                os.path.join(here, "oomshim.c"),
+                "-o",
+                target,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        import oomshim
+    except Exception:
+        pass
 
 
 def pytest_addoption(parser, pluginmanager):
